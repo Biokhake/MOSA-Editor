@@ -1,0 +1,349 @@
+/**
+ * =========================================================================
+ * MOSA Mechanical Design Engine — public API
+ * =========================================================================
+ *
+ * Framework-agnostic. `import { designSlot, designKit } from ".../engine"`
+ * from the studio, a CLI, or any other tool. Output is plain data
+ * (`SlotArtifact` / `KitArtifact`); use an adapter to render it.
+ *
+ * PIPELINE (per slot):
+ *   Brief → Proportions → Skeleton (joints + ROM + hardpoints)
+ *        → pick limb topology (critic-scored)
+ *        → Form grammar (tiered: frame · mass · panel · detail)
+ *        → generate-and-select (refine): N candidates, ROM + critic, keep best
+ *        → Functional check + Metrics measurement
+ *
+ * Classification into the ID grammar is done at POPULATION level
+ * (`classify.ts`), because a kit's letter is its decoration RANK among its
+ * band-mates — it can only be known once the whole set exists.
+ */
+
+import { makeBrief, briefFromLegacyId } from "./brief";
+import { resolveProportions } from "./proportions";
+import { buildRig, shinView, thighView } from "./skeleton";
+import type { ShinRig } from "./skeleton";
+import { grammarShin, shinInterfaces } from "./grammar/shin";
+import { grammarThigh, thighInterfaces } from "./grammar/thigh";
+import { grammarChestCore, grammarCockpitHatch, cockpitInterfaces, cockpitView, cockpitArchitecture } from "./grammar/cockpit";
+import { REFERENCE_BY_KEY, briefFromReference } from "./references";
+import { validateAssembly, partOrigin } from "./assembly";
+import { topologyPool, topologyAffinity } from "./grammar/topology";
+import type { LimbTopology } from "./grammar/topology";
+import { romSweepShin, romSweepThigh } from "./mechanics/romSweep";
+import { massReportShin, massReportLimb } from "./mechanics/mass";
+import { measureMetrics, classifyBand } from "./classify";
+import { critique } from "./critic";
+import { scoreProportions } from "./proportionScore";
+import { critiqueKit } from "./kitCritic";
+import { refine } from "./refine";
+import { generatePopulation } from "./population";
+import type { Population } from "./population";
+import type { Brief, KitArtifact, Proportions, SlotArtifact, SlotId, Rig } from "./types";
+
+export * from "./types";
+export { makeBrief, briefFromLegacyId, PHILOSOPHIES } from "./brief";
+export { measureMetrics, classifyBand, classifyBand as _classifyBand, assignId, bandLetters } from "./classify";
+export { PHILOSOPHIES as DESIGN_PHILOSOPHIES } from "./brief";
+export { critique } from "./critic";
+export { repair, dropBuried, dropRedundant, rootProtrusions } from "./repair";
+export { scoreProportions } from "./proportionScore";
+export { critiqueKit } from "./kitCritic";
+export type { KitCritique } from "./kitCritic";
+export type { ProportionReport } from "./proportionScore";
+export { rasterize, measureSilhouette, hiddenShare, visiblePrims } from "./raster";
+export type { Silhouette, SilhouetteMetrics } from "./raster";
+export type { Critique } from "./critic";
+export { generatePopulation } from "./population";
+export type { Population, PopulationEntry } from "./population";
+export { validateAssembly } from "./assembly";
+export type { AssemblyReport } from "./assembly";
+export { mountGeometry, mountAll, mountKindForDof } from "./grammar/mount";
+export { REFERENCES, REFERENCE_BY_KEY, LINEAGES, briefFromReference, idsAreAssigned } from "./references";
+export type { ReferenceArchetype, Lineage } from "./references";
+
+/** How many candidates the generate-and-select loop builds per slot. */
+const REFINE_COUNT = 5;
+
+/**
+ * The leg's armour topology. Both shin and thigh call this with the SAME
+ * inputs so they always agree — the leg reads as one design. "Best" = highest
+ * critic score on a probe shin, ROM failure lightly penalised.
+ */
+function chooseLegTopology(brief: Brief, prop: Proportions, shin: ShinRig): LimbTopology {
+  const pool = topologyPool(brief);
+  if (pool.length < 2) return pool[0] ?? "shell";
+  let best = pool[0]!;
+  let bestScore = -Infinity;
+  for (const t of pool) {
+    const prims = grammarShin(brief, prop, shin, { topology: t });
+    const rom = romSweepShin(prims, shin);
+    // critic quality + how much the philosophy wants this arrangement, so the
+    // critic's slight bias toward the simplest shell can't flatten every kit.
+    const score = critique(prims, brief).score - (rom.ok ? 0 : 0.2) + topologyAffinity(brief, t) * 0.18;
+    if (score > bestScore) {
+      bestScore = score;
+      best = t;
+    }
+  }
+  return best;
+}
+
+function shinArtifact(brief: Brief, prop: Proportions, view: ShinRig): SlotArtifact {
+  const topology = chooseLegTopology(brief, prop, view);
+  const { best, attempts } = refine(
+    brief,
+    (variant) => {
+      const prims = grammarShin(brief, prop, view, { topology, variant });
+      const rom = romSweepShin(prims, view);
+      return { prims, romOk: rom.ok, romCollisions: rom.collisions };
+    },
+    REFINE_COUNT,
+    (prims) => {
+      const rom = romSweepShin(prims, view);
+      return { romOk: rom.ok, romCollisions: rom.collisions };
+    },
+  );
+  const mass = massReportShin(best.prims, view);
+  return {
+    slot: "shin",
+    prims: best.prims,
+    joints: view.joints,
+    hardpoints: view.hardpoints,
+    interfaces: shinInterfaces(view),
+    functional: {
+      romOk: best.romOk,
+      romCollisions: best.romCollisions,
+      jointMoment: mass.jointMoment,
+      mass: mass.mass,
+      com: mass.com,
+      load: {
+        jointTorque: view.load.jointTorque,
+        actuator: view.load.actuator,
+        rails: view.load.rails,
+        armourAllowance: view.load.armourAllowance,
+        carriedMass: view.load.carriedMass,
+      },
+    },
+    aesthetic: {
+      score: best.critique.score,
+      penalties: best.critique.penalties,
+      notes: best.critique.notes,
+      variant: best.variant,
+      topology,
+      attempts: attempts.length,
+      repairs: best.repairs,
+    },
+  };
+}
+
+function thighArtifact(brief: Brief, prop: Proportions, rig: Rig): SlotArtifact {
+  const view = thighView(rig, "R");
+  const topology = chooseLegTopology(brief, prop, shinView(rig, "R"));
+  const { best, attempts } = refine(
+    brief,
+    (variant) => {
+      const prims = grammarThigh(brief, prop, view, { topology, variant });
+      const rom = romSweepThigh(prims, view);
+      return { prims, romOk: rom.ok, romCollisions: rom.collisions };
+    },
+    REFINE_COUNT,
+    (prims) => {
+      const rom = romSweepThigh(prims, view);
+      return { romOk: rom.ok, romCollisions: rom.collisions };
+    },
+  );
+  const mass = massReportLimb(best.prims, view.joints);
+  return {
+    slot: "thigh",
+    prims: best.prims,
+    joints: view.joints,
+    hardpoints: view.hardpoints,
+    interfaces: thighInterfaces(view),
+    functional: {
+      romOk: best.romOk,
+      romCollisions: best.romCollisions,
+      jointMoment: mass.jointMoment,
+      mass: mass.mass,
+      com: mass.com,
+      load: {
+        jointTorque: view.load.jointTorque,
+        actuator: view.load.actuator,
+        rails: view.load.rails,
+        armourAllowance: view.load.armourAllowance,
+        carriedMass: view.load.carriedMass,
+      },
+    },
+    aesthetic: {
+      score: best.critique.score,
+      penalties: best.critique.penalties,
+      notes: best.critique.notes,
+      variant: best.variant,
+      topology,
+      attempts: attempts.length,
+      repairs: best.repairs,
+    },
+  };
+}
+
+/**
+ * The chest core and the cockpit hatch are one design decision expressed in
+ * two slots, so they share an architecture record rather than being varied
+ * independently — otherwise the hatch language contradicts the plate it sits
+ * on. Neither goes through `refine`: their envelope is fixed by the studio's
+ * hand-placed collar / shoulder / Chest L/R sockets, so there is nothing for
+ * generate-and-select to search over. The critic still scores them.
+ */
+function chestArtifact(brief: Brief, prop: Proportions, rig: Rig, slot: "chestCore" | "cockpit"): SlotArtifact {
+  const view = cockpitView(brief);
+  const prims = slot === "chestCore" ? grammarChestCore(brief, prop) : grammarCockpitHatch(brief, prop);
+  const crit = critique(prims, brief);
+  const arch = cockpitArchitecture(brief);
+  const mass = massReportLimb(prims, []);
+  return {
+    slot,
+    prims,
+    joints: [],
+    hardpoints: [],
+    interfaces: slot === "chestCore" ? cockpitInterfaces(view) : [],
+    functional: {
+      // the torso does not sweep: it is the root the limbs are swept against,
+      // and its own articulation is the cervical column, checked with the head
+      romOk: true,
+      romCollisions: [],
+      jointMoment: mass.jointMoment,
+      mass: mass.mass,
+      com: mass.com,
+      load: {
+        jointTorque: { neck: rig.load.jointTorque.neck ?? 0.3 },
+        actuator: {},
+        rails: rig.load.member.torso!,
+        armourAllowance: rig.load.armour.torso ?? 1,
+        carriedMass: rig.load.bodyWeight,
+      },
+    },
+    aesthetic: {
+      score: crit.score,
+      penalties: crit.penalties,
+      notes: crit.notes,
+      variant: 0,
+      topology: `${arch.reactor}/${arch.breastplate}/${arch.hatch}/${arch.intake}`,
+      attempts: 1,
+    },
+  };
+}
+
+/** Design a single slot from a brief, given an already-built whole-body rig. */
+export function designSlotWithRig(slot: SlotId, brief: Brief, rig: Rig): SlotArtifact | null {
+  const prop = resolveProportions(brief);
+  if (slot === "shin") return shinArtifact(brief, prop, shinView(rig, "R"));
+  if (slot === "thigh") return thighArtifact(brief, prop, rig);
+  if (slot === "chestCore" || slot === "cockpit") return chestArtifact(brief, prop, rig, slot);
+  return null; // other slots still use the legacy generators for now
+}
+
+/** Design a single slot from a brief. Builds a fresh whole-body rig. */
+export function designSlot(slot: SlotId, brief: Brief): SlotArtifact | null {
+  const rig = buildRig(brief, resolveProportions(brief));
+  return designSlotWithRig(slot, brief, rig);
+}
+
+/** Build the whole-body rig for a brief (exposed for tools / inspection). */
+export function designRig(brief: Brief): Rig {
+  return buildRig(brief, resolveProportions(brief));
+}
+
+/**
+ * A lighter kit measurement for population generation — builds shin + thigh
+ * once and returns just the aggregate metrics + band (no per-slot artifacts,
+ * no rig echo).
+ */
+function measureKit(brief: Brief): {
+  brief: Brief;
+  metrics: ReturnType<typeof measureMetrics>;
+  band: ReturnType<typeof classifyBand>;
+  proportion: number;
+} {
+  const prop = resolveProportions(brief);
+  const rig = buildRig(brief, prop);
+  const prims = [
+    ...shinArtifact(brief, prop, shinView(rig, "R")).prims,
+    ...thighArtifact(brief, prop, rig).prims,
+  ];
+  const metrics = measureMetrics(prims);
+  return { brief, metrics, band: classifyBand(metrics), proportion: scoreProportions(prop, brief).score };
+}
+
+let _population: Population | null = null;
+
+/**
+ * The 100-kit population. Built once (deterministic), then reused. IDs are
+ * assigned here as an OUTPUT of measurement — see `population.ts`.
+ */
+export function getPopulation(): Population {
+  if (!_population) _population = generatePopulation(measureKit);
+  return _population;
+}
+
+/** Design a whole kit from a brief (Phase 3b: `shin` + `thigh` populated). */
+export function designKit(brief: Brief): KitArtifact {
+  const rig = buildRig(brief, resolveProportions(brief));
+  const slots: KitArtifact["slots"] = {};
+  const shin = designSlotWithRig("shin", brief, rig);
+  if (shin) slots.shin = shin;
+  const thigh = designSlotWithRig("thigh", brief, rig);
+  if (thigh) slots.thigh = thigh;
+
+  // Each slot's prims live in that PART's own frame. Measuring them pooled
+  // would overlay the shin on the thigh instead of stacking them, so place
+  // every part into body space first — the assembled silhouette is the thing
+  // a viewer actually reads.
+  const allPrims = Object.entries(slots).flatMap(([slot, s]) => {
+    const o = partOrigin(slot as SlotId, rig);
+    if (!o) return s!.prims;
+    return s!.prims.map((p) => ({
+      ...p,
+      pos: [p.pos[0] + o[0], p.pos[1] + o[1], p.pos[2] + o[2]] as [number, number, number],
+    }));
+  });
+  const interfaces = Object.entries(slots).flatMap(([slot, s]) =>
+    (s!.interfaces ?? []).map((i) => ({ ...i, id: `${slot}:${i.id}` })),
+  );
+  const metrics = measureMetrics(allPrims);
+  const kit: KitArtifact = { brief, slots, interfaces, metrics, band: classifyBand(metrics) };
+  const kc = critiqueKit(kit, brief, allPrims);
+  kit.aesthetic = { score: kc.score, penalties: kc.penalties, notes: kc.notes, accentShare: kc.accentShare };
+  kit.proportion = scoreProportions(resolveProportions(brief), brief).score;
+  return kit;
+}
+
+/**
+ * Check that every designed part is actually connected — no floating parts.
+ * Returns which parent interfaces met a mating child interface and which did
+ * not. Callable from any tool with a `KitArtifact`.
+ */
+export function checkKitAssembly(brief: Brief) {
+  const rig = buildRig(brief, resolveProportions(brief));
+  return validateAssembly(designKit(brief), rig);
+}
+
+/**
+ * Resolve a catalog ID to its brief. The ID now names a POPULATION member
+ * (its brief was chosen and measured, then handed this ID); the legacy decoder
+ * is only a fallback for IDs outside the generated set.
+ */
+export function briefForId(id: string): Brief {
+  const key = (id || "").trim().toUpperCase();
+  // A kit is a reference archetype until the catalogue is big enough for the
+  // ID grammar to mean anything (see references.ts). The population lookup is
+  // kept for when that day comes, and the legacy decoder for saved sessions.
+  const ref = REFERENCE_BY_KEY[key];
+  if (ref) return briefFromReference(ref);
+  const entry = getPopulation().byId[key];
+  return entry ? entry.brief : briefFromLegacyId(id);
+}
+
+/** Convenience for the studio's path: design a slot from a catalog ID. */
+export function designSlotFromLegacyId(slot: SlotId, id: string): SlotArtifact | null {
+  return designSlot(slot, briefForId(id));
+}
